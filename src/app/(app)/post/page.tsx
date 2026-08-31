@@ -13,6 +13,7 @@ export default function PostCallPage() {
   const [lookingUp, setLookingUp] = useState(false);
   const [error, setError] = useState("");
   const [price, setPrice] = useState<number | null>(null);
+  const [tokenImage, setTokenImage] = useState<string | null>(null);
 
   const [form, setForm] = useState({
     network: "solana",
@@ -27,59 +28,50 @@ export default function PostCallPage() {
   });
 
   async function lookupToken() {
-    const address = form.contract_address.trim();
-
-    if (!address || address.length < 20) return;
+    if (!form.contract_address || form.contract_address.length < 20) return;
 
     setLookingUp(true);
     setError("");
-    setPrice(null);
 
     try {
       const lookupRes = await fetch(
-        `/api/tokens/lookup?network=${form.network}&address=${encodeURIComponent(address)}`
+        `/api/tokens/lookup?network=${form.network}&address=${form.contract_address.trim()}`
       );
 
       const token = await lookupRes.json();
 
-      if (!lookupRes.ok || !token?.symbol) {
+      if (!lookupRes.ok || !token.symbol) {
         throw new Error("Token not found. Check the contract address.");
       }
 
       const priceRes = await fetch(
-        `/api/prices?network=${form.network}&addresses=${encodeURIComponent(address)}`
+        `/api/prices?network=${form.network}&addresses=${form.contract_address.trim()}`
       );
 
       const priceData = await priceRes.json();
 
-      if (!priceRes.ok) {
-        throw new Error(
-          priceData?.error || "Could not fetch the live token price."
-        );
-      }
-
       const rawPrice =
-        priceData?.data?.[address]?.price ??
-        priceData?.data?.[address]?.price_usd ??
-        token?.price_usd;
+        priceData?.data?.[form.contract_address.trim()]?.price ||
+        priceData?.data?.[form.contract_address.trim()]?.price_usd;
 
       const tokenPrice = Number(rawPrice);
 
-      if (!Number.isFinite(tokenPrice) || tokenPrice <= 0) {
+      if (!tokenPrice || tokenPrice <= 0) {
         throw new Error("Could not get a live price for this token.");
       }
 
       setPrice(tokenPrice);
+      setTokenImage(token.image || null);
 
       setForm((f) => ({
         ...f,
-        contract_address: address,
         symbol: token.symbol,
         token_name: token.name || "",
       }));
     } catch (err: any) {
-      setError(err?.message || "Token lookup failed");
+      setError(err.message || "Token lookup failed");
       setPrice(null);
+      setTokenImage(null);
     } finally {
       setLookingUp(false);
     }
@@ -89,34 +81,13 @@ export default function PostCallPage() {
     e.preventDefault();
     setError("");
 
-    if (!user?.id) {
-      setError("Not authenticated.");
-      return;
-    }
-
     if (!price || price <= 0) {
       setError("Get the live token price before publishing.");
       return;
     }
 
-    const targetPrice = Number(form.target_price);
-
-    if (!Number.isFinite(targetPrice) || targetPrice <= 0) {
+    if (!form.target_price || Number(form.target_price) <= 0) {
       setError("Enter a valid target price.");
-      return;
-    }
-
-    if (
-      form.invalidation_price &&
-      (!Number.isFinite(Number(form.invalidation_price)) ||
-        Number(form.invalidation_price) <= 0)
-    ) {
-      setError("Enter a valid invalidation price.");
-      return;
-    }
-
-    if (!form.thesis.trim()) {
-      setError("Write a thesis for your call.");
       return;
     }
 
@@ -124,77 +95,142 @@ export default function PostCallPage() {
 
     try {
       const supabase = createClient();
-      const privyId = user.id;
+      const privyId = user?.id;
 
-      let { data: profile, error: profileError } = await supabase
-        .from("profiles")
-        .select("id")
-        .eq("privy_id", privyId)
-        .single();
-
-      if (profileError && profileError.code !== "PGRST116") {
-        throw profileError;
+      if (!privyId) {
+        throw new Error("Not authenticated");
       }
 
+      // --------------------------------------------------
+      // 1. Get or create the user's profile
+      // --------------------------------------------------
+
+      let { data: profile } = await supabase
+        .from("profiles")
+        .select("id, active_calls")
+        .eq("privy_id", privyId)
+        .maybeSingle();
+
       if (!profile) {
-        const baseUsername =
+        const username =
           user?.email?.address?.split("@")[0] || `user_${Date.now()}`;
 
-        const { data: newProfile, error: createProfileError } =
-          await supabase
-            .from("profiles")
-            .insert({
-              privy_id: privyId,
-              username: baseUsername,
-              display_name: baseUsername,
-            })
-            .select("id")
-            .single();
+        const { data: newProfile, error: profileError } = await supabase
+          .from("profiles")
+          .insert({
+            privy_id: privyId,
+            username,
+            display_name: username,
+          })
+          .select("id, active_calls")
+          .single();
 
-        if (createProfileError) {
-          throw createProfileError;
-        }
+        if (profileError) throw profileError;
 
         profile = newProfile;
       }
 
+      // --------------------------------------------------
+      // 2. Find the token in our verified token registry
+      // --------------------------------------------------
+
       const address = form.contract_address.trim();
 
-      /*
-       * Capture the market price at the exact moment the call is published.
-       * The user never manually enters an entry price.
-       */
+      const { data: existingToken, error: tokenLookupError } = await supabase
+        .from("tokens")
+        .select("id, is_verified")
+        .eq("network", form.network)
+        .eq("contract_address", address)
+        .maybeSingle();
+
+      if (tokenLookupError) {
+        throw tokenLookupError;
+      }
+
+      let tokenId = existingToken?.id || null;
+
+      // --------------------------------------------------
+      // 3. If token isn't registered yet, create it
+      // --------------------------------------------------
+
+      if (!tokenId) {
+        const { data: newToken, error: tokenInsertError } = await supabase
+          .from("tokens")
+          .insert({
+            network: form.network,
+            contract_address: address,
+            symbol: form.symbol.toUpperCase(),
+            name: form.token_name || form.symbol.toUpperCase(),
+            image_url: tokenImage,
+            is_verified: false,
+          })
+          .select("id")
+          .single();
+
+        if (tokenInsertError) {
+          // Another request may have created it simultaneously.
+          const { data: retryToken } = await supabase
+            .from("tokens")
+            .select("id")
+            .eq("network", form.network)
+            .eq("contract_address", address)
+            .maybeSingle();
+
+          if (!retryToken) throw tokenInsertError;
+
+          tokenId = retryToken.id;
+        } else {
+          tokenId = newToken.id;
+        }
+      }
+
+      // --------------------------------------------------
+      // 4. Create the call and connect it to the token
+      // --------------------------------------------------
+
       const { error: callError } = await supabase.from("calls").insert({
         user_id: profile.id,
+        token_id: tokenId,
         network: form.network,
         contract_address: address,
         symbol: form.symbol.toUpperCase(),
-        token_name: form.token_name || null,
+        token_name: form.token_name,
         direction: form.direction,
+
+        // Live price captured at publication.
         entry_price: price,
-        target_price: targetPrice,
+
+        target_price: Number(form.target_price),
+
         invalidation_price: form.invalidation_price
           ? Number(form.invalidation_price)
           : null,
+
         timeframe: form.timeframe,
         thesis: form.thesis.trim(),
         status: "active",
       });
 
-      if (callError) {
-        throw callError;
-      }
+      if (callError) throw callError;
 
-      /*
-       * active_calls is intentionally NOT incremented here.
-       * We'll handle profile statistics at the database level so
-       * counts cannot become inconsistent.
-       */
+      // --------------------------------------------------
+      // 5. Increment active calls
+      // --------------------------------------------------
+
+      const currentActive = Number(profile.active_calls || 0);
+
+      await supabase
+        .from("profiles")
+        .update({
+          active_calls: currentActive + 1,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", profile.id);
 
       router.push("/home");
       router.refresh();
     } catch (err: any) {
-      setError(err?.message || "Failed to publish call");
+      setError(err.message || "Failed to publish call");
     } finally {
       setLoading(false);
     }
@@ -213,7 +249,7 @@ export default function PostCallPage() {
               value={form.network}
               onChange={(e) => {
                 setPrice(null);
-                setError("");
+                setTokenImage(null);
 
                 setForm({
                   ...form,
@@ -229,6 +265,8 @@ export default function PostCallPage() {
               <option value="eth">Ethereum</option>
               <option value="base">Base</option>
               <option value="bsc">BSC</option>
+              <option value="arbitrum">Arbitrum</option>
+              <option value="polygon">Polygon</option>
             </select>
           </div>
 
@@ -261,18 +299,16 @@ export default function PostCallPage() {
             value={form.contract_address}
             onChange={(e) => {
               setPrice(null);
-              setError("");
+              setTokenImage(null);
 
               setForm({
                 ...form,
                 contract_address: e.target.value,
-                symbol: "",
-                token_name: "",
               });
             }}
             onBlur={lookupToken}
             placeholder="Paste token contract address"
-            className="mt-1 w-full rounded-xl glass pl-3 pr-3 py-2.5 text-sm outline-none font-mono"
+            className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none font-mono"
           />
 
           {lookingUp && (
@@ -282,20 +318,6 @@ export default function PostCallPage() {
           )}
         </div>
 
-        {form.symbol && (
-          <div className="glass rounded-xl p-3">
-            <div className="text-xs text-zinc-500">Token</div>
-
-            <div className="font-semibold">
-              {form.symbol}
-            </div>
-
-            <div className="text-xs text-zinc-500">
-              {form.token_name}
-            </div>
-          </div>
-        )}
-
         {price !== null && (
           <div className="glass rounded-xl p-4">
             <div className="text-xs text-zinc-500">
@@ -303,14 +325,35 @@ export default function PostCallPage() {
             </div>
 
             <div className="text-2xl font-semibold mt-1">
-              $
-              {price < 0.01
-                ? price.toFixed(8)
-                : price.toFixed(4)}
+              ${price < 0.01 ? price.toFixed(8) : price.toFixed(4)}
             </div>
 
             <div className="text-xs text-emerald-400 mt-1">
-              This price will be locked as your entry price when published.
+              This price will be locked as your entry price.
+            </div>
+          </div>
+        )}
+
+        {form.symbol && (
+          <div className="glass rounded-xl p-3 flex items-center gap-3">
+            {tokenImage ? (
+              <img
+                src={tokenImage}
+                alt=""
+                className="h-10 w-10 rounded-full object-cover"
+              />
+            ) : (
+              <div className="h-10 w-10 rounded-full bg-white/10" />
+            )}
+
+            <div>
+              <div className="font-semibold">
+                {form.symbol}
+              </div>
+
+              <div className="text-xs text-zinc-500">
+                {form.token_name}
+              </div>
             </div>
           </div>
         )}
@@ -324,7 +367,6 @@ export default function PostCallPage() {
             required
             type="number"
             step="any"
-            min="0"
             value={form.target_price}
             onChange={(e) =>
               setForm({
@@ -345,7 +387,6 @@ export default function PostCallPage() {
           <input
             type="number"
             step="any"
-            min="0"
             value={form.invalidation_price}
             onChange={(e) =>
               setForm({
