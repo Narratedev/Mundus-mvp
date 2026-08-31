@@ -8,15 +8,18 @@ import { usePrivy } from "@privy-io/react-auth";
 export default function PostCallPage() {
   const { user } = usePrivy();
   const router = useRouter();
+
   const [loading, setLoading] = useState(false);
+  const [lookingUp, setLookingUp] = useState(false);
   const [error, setError] = useState("");
+  const [price, setPrice] = useState<number | null>(null);
+
   const [form, setForm] = useState({
     network: "solana",
     contract_address: "",
     symbol: "",
     token_name: "",
     direction: "bullish" as "bullish" | "bearish",
-    entry_price: "",
     target_price: "",
     invalidation_price: "",
     timeframe: "1w",
@@ -24,76 +27,174 @@ export default function PostCallPage() {
   });
 
   async function lookupToken() {
-    if (!form.contract_address || form.contract_address.length < 20) return;
+    const address = form.contract_address.trim();
+
+    if (!address || address.length < 20) return;
+
+    setLookingUp(true);
+    setError("");
+    setPrice(null);
+
     try {
-      const res = await fetch(
-        `/api/tokens/lookup?network=${form.network}&address=${form.contract_address}`
+      const lookupRes = await fetch(
+        `/api/tokens/lookup?network=${form.network}&address=${encodeURIComponent(address)}`
       );
-      const data = await res.json();
-      if (data.symbol) {
-        setForm((f) => ({
-          ...f,
-          symbol: data.symbol,
-          token_name: data.name || "",
-        }));
+
+      const token = await lookupRes.json();
+
+      if (!lookupRes.ok || !token?.symbol) {
+        throw new Error("Token not found. Check the contract address.");
       }
-    } catch {
-      // ignore
+
+      const priceRes = await fetch(
+        `/api/prices?network=${form.network}&addresses=${encodeURIComponent(address)}`
+      );
+
+      const priceData = await priceRes.json();
+
+      if (!priceRes.ok) {
+        throw new Error(
+          priceData?.error || "Could not fetch the live token price."
+        );
+      }
+
+      const rawPrice =
+        priceData?.data?.[address]?.price ??
+        priceData?.data?.[address]?.price_usd ??
+        token?.price_usd;
+
+      const tokenPrice = Number(rawPrice);
+
+      if (!Number.isFinite(tokenPrice) || tokenPrice <= 0) {
+        throw new Error("Could not get a live price for this token.");
+      }
+
+      setPrice(tokenPrice);
+
+      setForm((f) => ({
+        ...f,
+        contract_address: address,
+        symbol: token.symbol,
+        token_name: token.name || "",
+      }));
+    } catch (err: any) {
+      setError(err?.message || "Token lookup failed");
+      setPrice(null);
+    } finally {
+      setLookingUp(false);
     }
   }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+
+    if (!user?.id) {
+      setError("Not authenticated.");
+      return;
+    }
+
+    if (!price || price <= 0) {
+      setError("Get the live token price before publishing.");
+      return;
+    }
+
+    const targetPrice = Number(form.target_price);
+
+    if (!Number.isFinite(targetPrice) || targetPrice <= 0) {
+      setError("Enter a valid target price.");
+      return;
+    }
+
+    if (
+      form.invalidation_price &&
+      (!Number.isFinite(Number(form.invalidation_price)) ||
+        Number(form.invalidation_price) <= 0)
+    ) {
+      setError("Enter a valid invalidation price.");
+      return;
+    }
+
+    if (!form.thesis.trim()) {
+      setError("Write a thesis for your call.");
+      return;
+    }
+
     setLoading(true);
 
     try {
       const supabase = createClient();
-      // Ensure profile exists (sync from Privy)
-      const privyId = user?.id;
-      if (!privyId) throw new Error("Not authenticated");
+      const privyId = user.id;
 
-      let { data: profile } = await supabase
+      let { data: profile, error: profileError } = await supabase
         .from("profiles")
         .select("id")
         .eq("privy_id", privyId)
         .single();
 
+      if (profileError && profileError.code !== "PGRST116") {
+        throw profileError;
+      }
+
       if (!profile) {
-        const { data: newProfile, error: pErr } = await supabase
-          .from("profiles")
-          .insert({
-            privy_id: privyId,
-            username: user?.email?.address?.split("@")[0] || `user_${Date.now()}`,
-            display_name: user?.email?.address?.split("@")[0] || "User",
-          })
-          .select("id")
-          .single();
-        if (pErr) throw pErr;
+        const baseUsername =
+          user?.email?.address?.split("@")[0] || `user_${Date.now()}`;
+
+        const { data: newProfile, error: createProfileError } =
+          await supabase
+            .from("profiles")
+            .insert({
+              privy_id: privyId,
+              username: baseUsername,
+              display_name: baseUsername,
+            })
+            .select("id")
+            .single();
+
+        if (createProfileError) {
+          throw createProfileError;
+        }
+
         profile = newProfile;
       }
 
-      const { error: cErr } = await supabase.from("calls").insert({
-        user_id: profile!.id,
+      const address = form.contract_address.trim();
+
+      /*
+       * Capture the market price at the exact moment the call is published.
+       * The user never manually enters an entry price.
+       */
+      const { error: callError } = await supabase.from("calls").insert({
+        user_id: profile.id,
         network: form.network,
-        contract_address: form.contract_address,
+        contract_address: address,
         symbol: form.symbol.toUpperCase(),
-        token_name: form.token_name,
+        token_name: form.token_name || null,
         direction: form.direction,
-        entry_price: parseFloat(form.entry_price),
-        target_price: parseFloat(form.target_price),
+        entry_price: price,
+        target_price: targetPrice,
         invalidation_price: form.invalidation_price
-          ? parseFloat(form.invalidation_price)
+          ? Number(form.invalidation_price)
           : null,
         timeframe: form.timeframe,
-        thesis: form.thesis,
+        thesis: form.thesis.trim(),
         status: "active",
       });
 
-      if (cErr) throw cErr;
+      if (callError) {
+        throw callError;
+      }
+
+      /*
+       * active_calls is intentionally NOT incremented here.
+       * We'll handle profile statistics at the database level so
+       * counts cannot become inconsistent.
+       */
+
       router.push("/home");
+      router.refresh();
     } catch (err: any) {
-      setError(err.message || "Failed to publish call");
+      setError(err?.message || "Failed to publish call");
     } finally {
       setLoading(false);
     }
@@ -107,10 +208,22 @@ export default function PostCallPage() {
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="text-xs text-zinc-400">Network</label>
+
             <select
               value={form.network}
-              onChange={(e) => setForm({ ...form, network: e.target.value })}
-              className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"
+              onChange={(e) => {
+                setPrice(null);
+                setError("");
+
+                setForm({
+                  ...form,
+                  network: e.target.value,
+                  contract_address: "",
+                  symbol: "",
+                  token_name: "",
+                });
+              }}
+              className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none"
             >
               <option value="solana">Solana</option>
               <option value="eth">Ethereum</option>
@@ -118,8 +231,10 @@ export default function PostCallPage() {
               <option value="bsc">BSC</option>
             </select>
           </div>
+
           <div>
             <label className="text-xs text-zinc-400">Direction</label>
+
             <select
               value={form.direction}
               onChange={(e) =>
@@ -128,7 +243,7 @@ export default function PostCallPage() {
                   direction: e.target.value as "bullish" | "bearish",
                 })
               }
-              className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"
+              className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none"
             >
               <option value="bullish">Bullish</option>
               <option value="bearish">Bearish</option>
@@ -138,87 +253,125 @@ export default function PostCallPage() {
 
         <div>
           <label className="text-xs text-zinc-400">
-            Contract Address (or search ticker later)
+            Contract Address
           </label>
+
           <input
             required
             value={form.contract_address}
-            onChange={(e) =>
-              setForm({ ...form, contract_address: e.target.value })
-            }
+            onChange={(e) => {
+              setPrice(null);
+              setError("");
+
+              setForm({
+                ...form,
+                contract_address: e.target.value,
+                symbol: "",
+                token_name: "",
+              });
+            }}
             onBlur={lookupToken}
-            placeholder="Token contract address"
-            className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+            placeholder="Paste token contract address"
+            className="mt-1 w-full rounded-xl glass pl-3 pr-3 py-2.5 text-sm outline-none font-mono"
+          />
+
+          {lookingUp && (
+            <p className="mt-2 text-xs text-zinc-500">
+              Fetching token data and live price...
+            </p>
+          )}
+        </div>
+
+        {form.symbol && (
+          <div className="glass rounded-xl p-3">
+            <div className="text-xs text-zinc-500">Token</div>
+
+            <div className="font-semibold">
+              {form.symbol}
+            </div>
+
+            <div className="text-xs text-zinc-500">
+              {form.token_name}
+            </div>
+          </div>
+        )}
+
+        {price !== null && (
+          <div className="glass rounded-xl p-4">
+            <div className="text-xs text-zinc-500">
+              Live market price
+            </div>
+
+            <div className="text-2xl font-semibold mt-1">
+              $
+              {price < 0.01
+                ? price.toFixed(8)
+                : price.toFixed(4)}
+            </div>
+
+            <div className="text-xs text-emerald-400 mt-1">
+              This price will be locked as your entry price when published.
+            </div>
+          </div>
+        )}
+
+        <div>
+          <label className="text-xs text-zinc-400">
+            Target $
+          </label>
+
+          <input
+            required
+            type="number"
+            step="any"
+            min="0"
+            value={form.target_price}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                target_price: e.target.value,
+              })
+            }
+            placeholder="Target price"
+            className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none"
           />
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="text-xs text-zinc-400">Symbol</label>
-            <input
-              required
-              value={form.symbol}
-              onChange={(e) => setForm({ ...form, symbol: e.target.value })}
-              placeholder="SOL"
-              className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"
-            />
-          </div>
-          <div>
-            <label className="text-xs text-zinc-400">Name</label>
-            <input
-              value={form.token_name}
-              onChange={(e) => setForm({ ...form, token_name: e.target.value })}
-              placeholder="Solana"
-              className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"
-            />
-          </div>
-        </div>
+        <div>
+          <label className="text-xs text-zinc-400">
+            Invalidation $
+          </label>
 
-        <div className="grid grid-cols-3 gap-3">
-          <div>
-            <label className="text-xs text-zinc-400">Entry $</label>
-            <input
-              required
-              type="number"
-              step="any"
-              value={form.entry_price}
-              onChange={(e) => setForm({ ...form, entry_price: e.target.value })}
-              className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"
-            />
-          </div>
-          <div>
-            <label className="text-xs text-zinc-400">Target $</label>
-            <input
-              required
-              type="number"
-              step="any"
-              value={form.target_price}
-              onChange={(e) =>
-                setForm({ ...form, target_price: e.target.value })
-              }
-              className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"
-            />
-          </div>
-          <div>
-            <label className="text-xs text-zinc-400">Invalidation $</label>
-            <input
-              type="number"
-              step="any"
-              value={form.invalidation_price}
-              onChange={(e) =>
-                setForm({ ...form, invalidation_price: e.target.value })
-              }
-              className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"
-            />
-          </div>
+          <input
+            type="number"
+            step="any"
+            min="0"
+            value={form.invalidation_price}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                invalidation_price: e.target.value,
+              })
+            }
+            placeholder="Optional"
+            className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none"
+          />
         </div>
 
         <div>
-          <label className="text-xs text-zinc-400">Timeframe</label>
+          <label className="text-xs text-zinc-400">
+            Timeframe
+          </label>
+
           <select
             value={form.timeframe}
-            onChange={(e) => setForm({ ...form, timeframe: e.target.value })}
-            className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500"
+            onChange={(e) =>
+              setForm({
+                ...form,
+                timeframe: e.target.value,
+              })
+            }
+            className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none"
           >
             <option value="1d">1 Day</option>
             <option value="1w">1 Week</option>
@@ -229,27 +382,37 @@ export default function PostCallPage() {
         </div>
 
         <div>
-          <label className="text-xs text-zinc-400">Thesis</label>
+          <label className="text-xs text-zinc-400">
+            Thesis
+          </label>
+
           <textarea
             required
             rows={4}
             value={form.thesis}
-            onChange={(e) => setForm({ ...form, thesis: e.target.value })}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                thesis: e.target.value,
+              })
+            }
             placeholder="Why this call? What's your edge?"
-            className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-indigo-500 resize-none"
+            className="mt-1 w-full rounded-xl glass px-3 py-2.5 text-sm outline-none resize-none"
           />
         </div>
 
         {error && (
-          <p className="text-sm text-rose-400">{error}</p>
+          <p className="text-sm text-rose-400">
+            {error}
+          </p>
         )}
 
         <button
           type="submit"
-          disabled={loading}
-          className="w-full rounded-full bg-indigo-500 py-3 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-50 transition"
+          disabled={loading || lookingUp || !price}
+          className="w-full rounded-full bg-indigo-500 py-3 text-sm font-semibold text-white disabled:opacity-50"
         >
-          {loading ? "Publishing…" : "Publish Call"}
+          {loading ? "Publishing..." : "Publish Call"}
         </button>
       </form>
     </div>
